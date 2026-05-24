@@ -16,6 +16,9 @@ import (
 
 var tokenRE = regexp.MustCompile(`\{([a-zA-Z0-9_:-]+)\}`)
 
+// mergeRoot is the absolute library root; --folder paths are resolved under Merge/.
+const mergeRoot = "/Volumes/hanxiongshi/Merge"
+
 type schemaConfig struct {
 	filesTable       string
 	foldersTable     string
@@ -71,7 +74,7 @@ func runPreview(args []string) error {
 	fs := flag.NewFlagSet("preview", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
-	dbPath, _, csvPath, _, err := parseSharedFlags(fs, args)
+	dbPath, _, csvPath, _, folderAbs, err := parseSharedFlags(fs, args)
 	if err != nil {
 		return err
 	}
@@ -83,12 +86,17 @@ func runPreview(args []string) error {
 	if err != nil {
 		return err
 	}
+	plans = filterPlansByFolder(plans, folderAbs)
 
 	if err := writeCSV(csvPath, plans); err != nil {
 		return err
 	}
 
-	fmt.Printf("Wrote %d rename rows to %s\n", len(plans), csvPath)
+	if folderAbs != "" {
+		fmt.Printf("Wrote %d rename rows to %s (folder: %s)\n", len(plans), csvPath, folderAbs)
+	} else {
+		fmt.Printf("Wrote %d rename rows to %s\n", len(plans), csvPath)
+	}
 	return nil
 }
 
@@ -96,19 +104,17 @@ func runApply(args []string) error {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
-	db := fs.String("db", "", "Path to sqlite database file.")
 	dryRun := fs.Bool("dry-run", false, "Only print rename operations, do not rename files.")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *db == "" {
-		return errors.New("missing required --db path")
-	}
-
-	plans, err := buildScenePreviewPlans(*db)
+	dbPath, _, _, _, folderAbs, err := parseSharedFlags(fs, args)
 	if err != nil {
 		return err
 	}
+
+	plans, err := buildScenePreviewPlans(dbPath)
+	if err != nil {
+		return err
+	}
+	plans = filterPlansByFolder(plans, folderAbs)
 
 	skipped := 0
 	actionable := 0
@@ -149,7 +155,7 @@ func runList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
-	dbPath, _, _, cfg, err := parseSharedFlags(fs, args)
+	dbPath, _, _, cfg, _, err := parseSharedFlags(fs, args)
 	if err != nil {
 		return err
 	}
@@ -170,10 +176,11 @@ func runList(args []string) error {
 	return nil
 }
 
-func parseSharedFlags(fs *flag.FlagSet, args []string) (dbPath, pattern, csvPath string, cfg schemaConfig, err error) {
+func parseSharedFlags(fs *flag.FlagSet, args []string) (dbPath, pattern, csvPath string, cfg schemaConfig, folderAbs string, err error) {
 	db := fs.String("db", "", "Path to sqlite database file.")
 	pat := fs.String("pattern", "{basename}{ext}", "Rename pattern. Tokens: {original}, {basename}, {ext}, {meta:<key>}.")
 	csv := fs.String("csv", "", "Path to CSV output file (used by preview).")
+	folder := fs.String("folder", "", "Only process files in this folder (relative to /Merge, e.g. /Stars or Stars/Album).")
 
 	cfg.filesTable = "files"
 	cfg.foldersTable = "folders"
@@ -200,14 +207,63 @@ func parseSharedFlags(fs *flag.FlagSet, args []string) (dbPath, pattern, csvPath
 	fs.StringVar(&cfg.metaValueColumn, "meta-value-column", cfg.metaValueColumn, "Metadata table value column name.")
 
 	if err := fs.Parse(args); err != nil {
-		return "", "", "", cfg, err
+		return "", "", "", cfg, "", err
 	}
 
 	if *db == "" {
-		return "", "", "", cfg, errors.New("missing required --db path")
+		return "", "", "", cfg, "", errors.New("missing required --db path")
 	}
 
-	return *db, *pat, *csv, cfg, nil
+	folderAbs, err = resolveFolderFilter(*folder)
+	if err != nil {
+		return "", "", "", cfg, "", err
+	}
+
+	return *db, *pat, *csv, cfg, folderAbs, nil
+}
+
+// resolveFolderFilter maps a --folder value to an absolute directory under mergeRoot.
+// Examples: "/Stars" -> "/Volumes/hanxiongshi/Merge/Stars"
+func resolveFolderFilter(folder string) (string, error) {
+	folder = strings.TrimSpace(folder)
+	if folder == "" {
+		return "", nil
+	}
+
+	cleaned := filepath.Clean(folder)
+	merge := filepath.Clean(mergeRoot)
+
+	if cleaned == merge {
+		return merge, nil
+	}
+	if strings.HasPrefix(cleaned, merge+string(os.PathSeparator)) {
+		return cleaned, nil
+	}
+
+	rel := strings.TrimPrefix(cleaned, string(filepath.Separator))
+	rel = strings.TrimPrefix(rel, "Merge"+string(os.PathSeparator))
+	if rel == "Merge" {
+		return merge, nil
+	}
+	if rel == "" {
+		return "", fmt.Errorf("invalid --folder %q", folder)
+	}
+
+	return filepath.Join(merge, rel), nil
+}
+
+func filterPlansByFolder(plans []renamePlan, folderAbs string) []renamePlan {
+	if folderAbs == "" {
+		return plans
+	}
+	folderAbs = filepath.Clean(folderAbs)
+	filtered := make([]renamePlan, 0, len(plans))
+	for _, p := range plans {
+		if filepath.Clean(filepath.Dir(p.From)) == folderAbs {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
 }
 
 func buildPlans(dbPath, pattern string, cfg schemaConfig) ([]renamePlan, error) {
@@ -507,6 +563,7 @@ func printUsage() {
   renamer-go apply   --db <db.sqlite> [--dry-run] [options]
 
 Options:
+  --folder "/Stars/Album"   Only files in this folder (relative to /Merge)
   --pattern "{meta:artist} - {meta:title}{ext}"
   --files-table files
   --folders-table folders

@@ -24,6 +24,17 @@ Override table/column names via flags if needed.
   --pattern "{meta:artist} - {meta:title}{ext}"
 ```
 
+Limit to one folder (paths are relative to `/Merge` on the library volume):
+
+```bash
+./renamer-go preview \
+  --db ./files.sqlite \
+  --csv ./rename-preview.csv \
+  --folder "/Stars/Abigaile Johnson - 2009"
+```
+
+`/Stars/...` resolves to `/Volumes/hanxiongshi/Merge/Stars/...`.
+
 ## Apply mode
 
 Dry run:
@@ -32,6 +43,15 @@ Dry run:
 ./renamer-go apply \
   --db ./files.sqlite \
   --pattern "{meta:artist} - {meta:title}{ext}" \
+  --dry-run
+```
+
+Dry run for a single folder:
+
+```bash
+./renamer-go apply \
+  --db ./files.sqlite \
+  --folder "/Stars/Abigaile Johnson - 2009" \
   --dry-run
 ```
 
