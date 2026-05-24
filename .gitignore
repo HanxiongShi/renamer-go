@@ -1,0 +1,5 @@
+# go build -o renamer-go .
+/renamer-go
+
+# preview --csv output
+*.csv
