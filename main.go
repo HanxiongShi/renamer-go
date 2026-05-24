@@ -117,7 +117,8 @@ func runApply(args []string) error {
 	plans = filterPlansByFolder(plans, folderAbs)
 
 	skipped := 0
-	actionable := 0
+	renamed := 0
+	notFound := 0
 
 	if *dryRun {
 		for _, p := range plans {
@@ -125,10 +126,15 @@ func runApply(args []string) error {
 				skipped++
 				continue
 			}
-			actionable++
+			if _, err := os.Stat(p.From); errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(os.Stderr, "Skipping (not found): %s\n", p.From)
+				notFound++
+				continue
+			}
 			fmt.Printf("[DRY RUN] %s -> %s\n", p.From, p.To)
+			renamed++
 		}
-		fmt.Printf("Dry run complete. %d files would be renamed, %d skipped (insufficient metadata).\n", actionable, skipped)
+		printApplySummary(folderAbs, renamed, skipped, notFound, true)
 		return nil
 	}
 
@@ -140,15 +146,42 @@ func runApply(args []string) error {
 		if p.From == p.To {
 			continue
 		}
-		actionable++
+		if _, err := os.Stat(p.From); errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "Skipping (not found): %s\n", p.From)
+			notFound++
+			continue
+		}
 		if err := os.Rename(p.From, p.To); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(os.Stderr, "Skipping (not found): %s\n", p.From)
+				notFound++
+				continue
+			}
 			return fmt.Errorf("rename %q -> %q: %w", p.From, p.To, err)
 		}
+		renamed++
 		fmt.Printf("Renamed: %s -> %s\n", p.From, p.To)
 	}
 
-	fmt.Printf("Rename complete. %d file(s) renamed, %d skipped (insufficient metadata).\n", actionable, skipped)
+	printApplySummary(folderAbs, renamed, skipped, notFound, false)
 	return nil
+}
+
+func printApplySummary(folderAbs string, renamed, skipped, notFound int, dryRun bool) {
+	prefix := "Rename complete"
+	suffix := fmt.Sprintf("%d file(s) renamed, %d skipped (insufficient metadata)", renamed, skipped)
+	if dryRun {
+		prefix = "Dry run complete"
+		suffix = fmt.Sprintf("%d files would be renamed, %d skipped (insufficient metadata)", renamed, skipped)
+	}
+	if notFound > 0 {
+		suffix += fmt.Sprintf(", %d not found", notFound)
+	}
+	if folderAbs != "" {
+		fmt.Printf("%s (folder: %s). %s.\n", prefix, folderAbs, suffix)
+	} else {
+		fmt.Printf("%s. %s.\n", prefix, suffix)
+	}
 }
 
 func runList(args []string) error {
@@ -294,9 +327,9 @@ func buildPlans(dbPath, pattern string, cfg schemaConfig) ([]renamePlan, error) 
 }
 
 func buildScenePreviewPlans(dbPath string) ([]renamePlan, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openReadOnlyDB(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
+		return nil, err
 	}
 	defer db.Close()
 
@@ -383,9 +416,9 @@ ORDER BY f.id
 }
 
 func loadRecords(dbPath string, cfg schemaConfig) ([]fileRecord, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openReadOnlyDB(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
+		return nil, err
 	}
 	defer db.Close()
 
@@ -551,6 +584,65 @@ func writeCSV(path string, plans []renamePlan) error {
 	return nil
 }
 
+func openReadOnlyDB(dbPath string) (*sql.DB, error) {
+	abs, err := resolveDBPath(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	dsn := "file:" + filepath.ToSlash(abs) + "?mode=ro"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database %s: %w", abs, err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open database %s: %w", abs, err)
+	}
+	return db, nil
+}
+
+func resolveDBPath(dbPath string) (string, error) {
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == "" {
+		return "", errors.New("empty database path")
+	}
+
+	if strings.HasPrefix(dbPath, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		switch dbPath {
+		case "~":
+			return "", errors.New("database path must be a file, not ~")
+		default:
+			if !strings.HasPrefix(dbPath, "~/") {
+				return "", fmt.Errorf("unsupported database path %q", dbPath)
+			}
+			dbPath = filepath.Join(home, dbPath[2:])
+		}
+	}
+
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("database file not found: %s", abs)
+		}
+		return "", fmt.Errorf("database file %s: %w", abs, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("database path is a directory: %s", abs)
+	}
+
+	return abs, nil
+}
+
 func quoteIdent(s string) string {
 	escaped := strings.ReplaceAll(s, `"`, `""`)
 	return `"` + escaped + `"`
@@ -560,7 +652,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage:
   renamer-go preview --db <db.sqlite> --csv <output.csv> [options]
   renamer-go list    --db <db.sqlite> [options]
-  renamer-go apply   --db <db.sqlite> [--dry-run] [options]
+  renamer-go apply   --db <db.sqlite> [--folder <path>] [--dry-run] [options]
 
 Options:
   --folder "/Stars/Album"   Only files in this folder (relative to /Merge)

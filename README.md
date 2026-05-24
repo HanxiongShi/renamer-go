@@ -55,7 +55,15 @@ Dry run for a single folder:
   --dry-run
 ```
 
-Real rename:
+Real rename (single folder):
+
+```bash
+./renamer-go apply \
+  --db ./files.sqlite \
+  --folder "/Stars/Abigaile Johnson - 2009"
+```
+
+Real rename (entire library):
 
 ```bash
 ./renamer-go apply \
